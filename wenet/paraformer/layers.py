@@ -39,20 +39,25 @@ class LFR(torch.nn.Module):
         self.left_padding_nums = math.ceil((self.m - 1) // 2)
 
     def forward(self, input: torch.Tensor,
-                input_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                input_lens: torch.Tensor, head_repeat=True) -> Tuple[torch.Tensor, torch.Tensor]:
+        if head_repeat:
+            left_padding_nums = self.left_padding_nums
+        else:
+            left_padding_nums = 0
+
         orign_type = input_lens.dtype
         input_lens = input_lens.to(torch.int64)
         B, _, D = input.size()
         n_lfr = torch.ceil(input_lens / self.n).to(input_lens.dtype)
         # right_padding_nums >= 0
-        prepad_nums = input_lens + self.left_padding_nums
+        prepad_nums = input_lens + left_padding_nums
 
         right_padding_nums = torch.where(
             self.m >= (prepad_nums - self.n * (n_lfr - 1)),
             self.m - (prepad_nums - self.n * (n_lfr - 1)),
             0,
         )
-        T_all = self.left_padding_nums + input_lens + right_padding_nums
+        T_all = left_padding_nums + input_lens + right_padding_nums
 
         new_len = T_all // self.n
 
@@ -63,7 +68,7 @@ class LFR(torch.nn.Module):
 
         tail_frames = torch.gather(input, 1, tail_frames_index)
         tail_frames = tail_frames.repeat(1, right_padding_nums.max().int(), 1)
-        head_frames = input[:, 0:1, :].repeat(1, self.left_padding_nums, 1)
+        head_frames = input[:, 0:1, :].repeat(1, left_padding_nums, 1)
 
         # stack
         input = torch.cat([head_frames, input, tail_frames], dim=1)
@@ -73,7 +78,7 @@ class LFR(torch.nn.Module):
                              dtype=input_lens.dtype).unsqueeze(0).repeat(
                                  B, 1)  # [B, T_all_max]
         # [B, T_all_max]
-        index_mask = index < (self.left_padding_nums + input_lens).unsqueeze(1)
+        index_mask = index < (left_padding_nums + input_lens).unsqueeze(1)
 
         tail_index_mask = torch.logical_not(
             index >= (T_all.unsqueeze(1))) & index_mask
@@ -89,7 +94,33 @@ class LFR(torch.nn.Module):
         # new len
         new_len = new_len.to(orign_type)
         return input.reshape(B, -1, D * self.m), new_len
+    
 
+class StreamingLFR(torch.nn.Module):
+    def __init__(self, m: int = 7, n: int = 6) -> None:
+        super().__init__()
+        self.m = m
+        self.n = n
+        self.left_padding_nums = math.ceil(self.m / 2) - 1
+        self.right_padding_nums = self.m // 2
+        self.lfr = LFR(m, n)
+
+    def forward(self, input, input_lens, cache, head_repeat=False):
+        cached_input = torch.cat([cache, input], dim=1)
+        cached_input_lens = input_lens + cache.shape[1]
+        
+        # compute the maximum number of chunks
+        max_n_chunks = ((cached_input_lens - self.m) // self.n + 1)
+        even_input_lens = (max_n_chunks-1) * self.n + self.m
+
+        lfr_output, lfr_lens = self.lfr(cached_input, cached_input_lens, head_repeat)
+        lfr_output = lfr_output[:, :max_n_chunks.max(), :]
+        lfr_lens = torch.clamp(lfr_lens, max=max_n_chunks)
+
+        new_cache = cached_input[:, even_input_lens.max()-self.m+self.n:]
+        
+        return lfr_output, lfr_lens, new_cache
+    
 
 class PositionwiseFeedForwardDecoderSANM(torch.nn.Module):
     """Positionwise feed forward layer.
